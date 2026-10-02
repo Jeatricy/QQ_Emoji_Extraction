@@ -1,4 +1,4 @@
-"""QQ 表情包提取与跨文件夹去重工具。Python 3.10+。
+"""QQ 表情包提取与多文件夹去重工具。Python 3.10+。
 
 界面使用 CustomTkinter；浅色 / 深色两套配色可在界面右上角实时切换。
 """
@@ -56,19 +56,23 @@ from emoji_core import (
     FileRecord,
     OperationResult,
     ScanResult,
+    dedup_candidates,
+    default_keepers,
     default_search_roots,
     delete_duplicates,
     detect_accounts,
     export_emojis,
     find_duplicates,
+    normalized,
     overlaps,
+    prepare_folders,
     readable_directory,
 )
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 SETTINGS_FILE = BASE_DIR / "qq_emoji_settings.json"
 LOG_FILE = BASE_DIR / "qq_emoji_tool.log"
-PAGE_SIZE = 24
+PAGE_SIZE = 12
 THUMB_SIZE = (176, 112)
 PREVIEW_SIZE = (700, 310)
 APPEARANCE_MODES = ("浅色", "深色")
@@ -150,7 +154,10 @@ class EmojiApp(ctk.CTk):
         self.account_rows: dict[str, ctk.CTkFrame] = {}
         self.scan_result: ScanResult | None = None
         self.checked: set[Path] = set()
+        self.keepers: dict[str, Path] = {}
         self.visible_checks: dict[Path, tk.BooleanVar] = {}
+        self.visible_check_widgets: dict[Path, ctk.CTkCheckBox] = {}
+        self.keeper_variables: dict[str, tk.StringVar] = {}
         self.page = 0
         self.thumbnail_generation = 0
         self.thumbnail_cancel = threading.Event()
@@ -173,6 +180,7 @@ class EmojiApp(ctk.CTk):
             "section": ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold"),
             "body": ctk.CTkFont(family=FONT_FAMILY, size=13),
             "body_bold": ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+            "tab": ctk.CTkFont(family=FONT_FAMILY, size=14, weight="normal"),
             "small": ctk.CTkFont(family=FONT_FAMILY, size=12),
             "tiny": ctk.CTkFont(family=FONT_FAMILY, size=11),
             "mono": ctk.CTkFont(family="Consolas", size=12),
@@ -232,6 +240,11 @@ class EmojiApp(ctk.CTk):
             segmented_button_unselected_hover_color=PALETTE["hover"],
             text_color=PALETTE["ink"], corner_radius=14, border_width=1, border_color=PALETTE["border"],
         )
+        try:
+            self.notebook.configure(segmented_button_font=self.fonts["tab"])
+        except ValueError:
+            # 兼容尚未公开标签字体参数的旧版 CustomTkinter。
+            self.notebook._segmented_button.configure(font=self.fonts["tab"])
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=26, pady=(0, 12))
         self.export_tab = self.notebook.add("01   提取表情包")
         self.compare_tab = self.notebook.add("02   查找重复文件")
@@ -379,30 +392,47 @@ class EmojiApp(ctk.CTk):
         tab.grid_rowconfigure(7, weight=1)
 
         head = ctk.CTkFrame(tab, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
-        ctk.CTkLabel(head, text="比较两个文件夹的文件内容", font=self.fonts["section"],
+        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(10, 6))
+        ctk.CTkLabel(head, text="多个文件夹一起扫描，每组保留一份", font=self.fonts["section"],
                      text_color=PALETTE["ink"]).pack(anchor="w")
         ctk.CTkLabel(
-            head, text="逐个文件计算 SHA-256，文件名不同也能找到相同内容。只列出两个文件夹之间的重复文件。",
+            head, text="同一文件夹内部、不同文件夹之间的重复都会列出。可只添加一个文件夹，也可添加多个。",
             font=self.fonts["small"], text_color=PALETTE["muted"], anchor="w", justify="left",
         ).pack(anchor="w", pady=(5, 0))
 
-        self.folder_a = tk.StringVar(value=self._saved_text("folder_a", ""))
-        self.folder_b = tk.StringVar(value=self._saved_text("folder_b", ""))
-        for offset, (side, variable) in enumerate((("A", self.folder_a), ("B", self.folder_b))):
-            row = ctk.CTkFrame(tab, fg_color="transparent")
-            row.grid(row=1 + offset, column=0, sticky="ew", padx=18, pady=3)
-            ctk.CTkLabel(row, text=f"文件夹 {side}", font=self.fonts["body"], text_color=PALETTE["ink_soft"],
-                         width=72, anchor="w").pack(side="left")
-            ctk.CTkEntry(
-                row, textvariable=variable, font=self.fonts["small"], height=34, corner_radius=9,
-                fg_color=PALETTE["surface"], border_color=PALETTE["border"], text_color=PALETTE["ink"],
-            ).pack(side="left", fill="x", expand=True)
-            self._make_button(row, "选择文件夹", lambda v=variable: self._choose_directory(v)).pack(
-                side="left", padx=(8, 0))
+        saved_folders = self.settings.get("scan_folders")
+        if not isinstance(saved_folders, list):
+            saved_folders = [self._saved_text("folder_a", ""), self._saved_text("folder_b", "")]
+        self.scan_folders: list[Path] = []
+        for text in saved_folders:
+            if isinstance(text, str) and text.strip():
+                folder = Path(os.path.expandvars(text.strip().strip('"'))).expanduser().resolve()
+                if folder not in self.scan_folders:
+                    self.scan_folders.append(folder)
+        folder_actions = ctk.CTkFrame(tab, fg_color="transparent")
+        folder_actions.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 6))
+        self._make_button(folder_actions, "添加文件夹", self._choose_scan_folder, width=108).pack(side="left")
+        self._make_button(folder_actions, "批量添加路径", self._paste_scan_folders, width=116).pack(
+            side="left", padx=6)
+        self._make_button(folder_actions, "清空列表", self._clear_scan_folders, width=88).pack(side="left")
+        ctk.CTkLabel(folder_actions, text="靠前文件夹优先 · 同一文件夹按相对路径排序 · ↑ ↓ 调整顺序",
+                     font=self.fonts["small"], text_color=PALETTE["muted"]).pack(side="right")
+        folder_panel = ctk.CTkFrame(tab, height=88, fg_color="transparent")
+        folder_panel.grid(row=2, column=0, sticky="ew", padx=18)
+        folder_panel.grid_columnconfigure(0, weight=1)
+        folder_panel.grid_rowconfigure(0, weight=1)
+        folder_panel.grid_propagate(False)
+        self.folder_list = ctk.CTkScrollableFrame(
+            folder_panel, height=94, fg_color=PALETTE["surface"], corner_radius=10,
+            border_width=1, border_color=PALETTE["border"],
+            scrollbar_button_color=PALETTE["border"], scrollbar_button_hover_color=PALETTE["muted"],
+        )
+        self.folder_list.grid(row=0, column=0, sticky="nsew")
+        self.folder_list.grid_columnconfigure(0, weight=1)
+        self._render_scan_folders()
 
         options = ctk.CTkFrame(tab, fg_color="transparent")
-        options.grid(row=3, column=0, sticky="ew", padx=18, pady=(10, 10))
+        options.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 8))
         self.recursive = tk.BooleanVar(value=bool(self.settings.get("recursive", True)))
         self.recursive_box = ctk.CTkCheckBox(
             options, text="包含子文件夹", variable=self.recursive, command=self._invalidate_results,
@@ -413,7 +443,7 @@ class EmojiApp(ctk.CTk):
         self.recursive_box.pack(side="left")
         self.scan_button = ctk.CTkButton(
             options, text="扫描重复文件", font=self.fonts["body_bold"], command=self._scan,
-            width=132, height=38, corner_radius=10, fg_color=PALETTE["accent"],
+            width=132, height=36, corner_radius=10, fg_color=PALETTE["accent"],
             hover_color=PALETTE["accent_hover"], text_color=PALETTE["on_accent"],
         )
         self.scan_button.pack(side="right")
@@ -423,33 +453,18 @@ class EmojiApp(ctk.CTk):
         summary.grid(row=4, column=0, sticky="ew", padx=18)
         summary.grid_columnconfigure(0, weight=1)
         inner = ctk.CTkFrame(summary, fg_color="transparent")
-        inner.grid(row=0, column=0, sticky="ew", padx=16, pady=12)
+        inner.grid(row=0, column=0, sticky="ew", padx=16, pady=10)
         inner.grid_columnconfigure(0, weight=1)
-        self.summary_text = tk.StringVar(value="选择两个文件夹后开始扫描")
+        self.summary_text = tk.StringVar(value="添加一个或多个文件夹后开始扫描")
         ctk.CTkLabel(inner, textvariable=self.summary_text, font=self.fonts["body_bold"],
-                     text_color=PALETTE["ink"], anchor="w", justify="left").grid(row=0, column=0, sticky="ew")
+                      text_color=PALETTE["ink"], anchor="w", justify="left", wraplength=650).grid(
+                          row=0, column=0, sticky="ew")
         self.selection_text = tk.StringVar(value="已勾选 0 个文件")
         ctk.CTkLabel(inner, textvariable=self.selection_text, font=self.fonts["small"],
                      text_color=PALETTE["accent"]).grid(row=0, column=1, sticky="e")
-        target = ctk.CTkFrame(inner, fg_color="transparent")
-        target.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        ctk.CTkLabel(target, text="清理位置：", font=self.fonts["small"],
-                     text_color=PALETTE["ink_soft"]).pack(side="left")
-        self.target_side = tk.StringVar(value="B")
-        self.side_buttons: dict[str, ctk.CTkRadioButton] = {}
-        for value, text in (("A", "文件夹 A（保留 B）"), ("B", "文件夹 B（保留 A）")):
-            button = ctk.CTkRadioButton(
-                target, text=text, value=value, variable=self.target_side, command=self._change_side,
-                font=self.fonts["small"], text_color=PALETTE["ink"], fg_color=PALETTE["accent"],
-                hover_color=PALETTE["accent_hover"], border_color=PALETTE["muted"], radiobutton_width=20,
-                radiobutton_height=20,
-            )
-            button.pack(side="left", padx=(6, 14))
-            self.side_buttons[value] = button
-
         toolbar = ctk.CTkFrame(tab, fg_color="transparent")
-        toolbar.grid(row=5, column=0, sticky="ew", padx=18, pady=(10, 6))
-        self._make_button(toolbar, "全选所有页", self._select_all, width=98).pack(side="left")
+        toolbar.grid(row=5, column=0, sticky="ew", padx=18, pady=(8, 4))
+        self._make_button(toolbar, "全选多余副本", self._select_all, width=116).pack(side="left")
         self._make_button(toolbar, "取消全选", self._select_none, width=88).pack(side="left", padx=(6, 8))
         self.delete_button = ctk.CTkButton(
             toolbar, text="删除勾选项（回收站）", font=self.fonts["body"], command=self._delete, state="disabled",
@@ -457,6 +472,12 @@ class EmojiApp(ctk.CTk):
             text_color=PALETTE["on_accent"],
         )
         self.delete_button.pack(side="right")
+        self.dedup_button = ctk.CTkButton(
+            toolbar, text="一键去重（每组留一份）", font=self.fonts["body_bold"], command=self._deduplicate,
+            state="disabled", width=190, height=34, corner_radius=9, fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hover"], text_color=PALETTE["on_accent"],
+        )
+        self.dedup_button.pack(side="right", padx=(0, 8))
 
         self.target_hint = tk.StringVar(value="")
         ctk.CTkLabel(tab, textvariable=self.target_hint, font=self.fonts["small"], text_color=PALETTE["muted"],
@@ -471,7 +492,7 @@ class EmojiApp(ctk.CTk):
                      text_color=PALETTE["ink_soft"], width=110).pack(side="left", padx=10)
         self.next_button = self._make_button(pager, "下一页 →", lambda: self._turn_page(1), width=92)
         self.next_button.pack(side="left")
-        self.gallery_hint = tk.StringVar(value="扫描后显示重复文件 · 每页 24 个")
+        self.gallery_hint = tk.StringVar(value=f"按重复组展示 · 每页 {PAGE_SIZE} 组")
         ctk.CTkLabel(pager, textvariable=self.gallery_hint, font=self.fonts["small"],
                      text_color=PALETTE["muted"]).pack(side="right")
 
@@ -481,9 +502,109 @@ class EmojiApp(ctk.CTk):
             scrollbar_button_hover_color=PALETTE["muted"],
         )
         self.gallery.grid(row=7, column=0, sticky="nsew", padx=18, pady=(6, 0))
-        self.folder_a.trace_add("write", lambda *_: self._invalidate_results())
-        self.folder_b.trace_add("write", lambda *_: self._invalidate_results())
         self._render_results()
+
+    def _render_scan_folders(self) -> None:
+        for child in self.folder_list.winfo_children():
+            child.destroy()
+        if not self.scan_folders:
+            ctk.CTkLabel(self.folder_list, text="点击“添加文件夹”，或批量粘贴多个文件夹路径。",
+                         font=self.fonts["small"], text_color=PALETTE["muted"]).grid(
+                             row=0, column=0, pady=26)
+        for index, folder in enumerate(self.scan_folders):
+            row = ctk.CTkFrame(self.folder_list, fg_color="transparent")
+            row.grid(row=index, column=0, sticky="ew", padx=6, pady=3)
+            row.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(row, text=f"文件夹 {index + 1}", width=78, anchor="w", font=self.fonts["small"],
+                         text_color=PALETTE["ink_soft"]).grid(row=0, column=0, padx=(2, 6))
+            entry = ctk.CTkEntry(row, height=30, font=self.fonts["small"], fg_color=PALETTE["raised"],
+                                 border_color=PALETTE["border"], text_color=PALETTE["ink"])
+            entry.insert(0, str(folder))
+            entry.configure(state="readonly")
+            entry.grid(row=0, column=1, sticky="ew")
+            up = self._make_button(row, "↑", lambda i=index: self._move_scan_folder(i, -1), width=34)
+            up.grid(row=0, column=2, padx=(6, 3))
+            down = self._make_button(row, "↓", lambda i=index: self._move_scan_folder(i, 1), width=34)
+            down.grid(row=0, column=3, padx=3)
+            self._set_enabled(up, index > 0)
+            self._set_enabled(down, index + 1 < len(self.scan_folders))
+            self._make_button(row, "移除", lambda i=index: self._remove_scan_folder(i), width=58).grid(
+                row=0, column=4, padx=(3, 0))
+
+    def _add_scan_folders(self, texts: list[str]) -> bool:
+        if self.busy:
+            return False
+        try:
+            folders = prepare_folders([Path(os.path.expandvars(text.strip().strip('"'))).expanduser()
+                                       for text in texts if text.strip()])
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法添加文件夹", str(exc), parent=self)
+            return False
+        existing = {normalized(folder) for folder in self.scan_folders}
+        added = [folder for folder in folders if normalized(folder) not in existing]
+        if added:
+            self.scan_folders.extend(added)
+            self._invalidate_results()
+            self._render_scan_folders()
+            self._save_settings()
+        self.status.set(f"已添加 {len(added)} 个文件夹，当前共 {len(self.scan_folders)} 个；相同路径自动忽略。")
+        return True
+
+    def _choose_scan_folder(self) -> None:
+        if self.busy:
+            return
+        initial = self.scan_folders[-1] if self.scan_folders and self.scan_folders[-1].is_dir() else BASE_DIR
+        chosen = filedialog.askdirectory(parent=self, title="添加要一起扫描的文件夹", initialdir=str(initial),
+                                         mustexist=True)
+        if chosen:
+            self._add_scan_folders([chosen])
+
+    def _paste_scan_folders(self) -> None:
+        if self.busy:
+            return
+        window = ctk.CTkToplevel(self)
+        window.title("批量添加文件夹")
+        window.geometry("760x410")
+        window.configure(fg_color=PALETTE["bg"])
+        ctk.CTkLabel(window, text="每行填写一个文件夹的完整路径，按粘贴顺序加入保留优先级列表。",
+                     font=self.fonts["body"], text_color=PALETTE["ink"]).pack(anchor="w", padx=20, pady=16)
+        paths = ctk.CTkTextbox(window, font=self.fonts["small"], fg_color=PALETTE["surface"],
+                               text_color=PALETTE["ink"], border_width=1, border_color=PALETTE["border"])
+        paths.pack(fill="both", expand=True, padx=20)
+
+        def add() -> None:
+            if self._add_scan_folders(paths.get("1.0", "end").splitlines()):
+                window.destroy()
+
+        actions = ctk.CTkFrame(window, fg_color="transparent")
+        actions.pack(fill="x", padx=20, pady=16)
+        self._make_button(actions, "取消", window.destroy, width=88).pack(side="right")
+        self._make_button(actions, "添加这些文件夹", add, width=140).pack(side="right", padx=8)
+        window.transient(self)
+        window.grab_set()
+        paths.focus_set()
+
+    def _move_scan_folder(self, index: int, delta: int) -> None:
+        target = index + delta
+        if self.busy or not 0 <= target < len(self.scan_folders):
+            return
+        self.scan_folders[index], self.scan_folders[target] = self.scan_folders[target], self.scan_folders[index]
+        self._folders_changed()
+
+    def _remove_scan_folder(self, index: int) -> None:
+        if not self.busy:
+            self.scan_folders.pop(index)
+            self._folders_changed()
+
+    def _clear_scan_folders(self) -> None:
+        if not self.busy:
+            self.scan_folders.clear()
+            self._folders_changed()
+
+    def _folders_changed(self) -> None:
+        self._invalidate_results()
+        self._render_scan_folders()
+        self._save_settings()
 
     # ------------------------------------------------------------ 小工具
 
@@ -521,8 +642,7 @@ class EmojiApp(ctk.CTk):
         settings = {
             "search_root": self.search_root.get(),
             "output_folder": self.output_folder.get(),
-            "folder_a": self.folder_a.get(),
-            "folder_b": self.folder_b.get(),
+            "scan_folders": [str(folder) for folder in self.scan_folders],
             "recursive": self.recursive.get(),
             "appearance": self.appearance_var.get(),
             "last_source": (str(self.selected_account.folder) if self.selected_account
@@ -617,9 +737,8 @@ class EmojiApp(ctk.CTk):
     def _use_export_for_compare(self) -> None:
         if self.busy:
             return
-        self.folder_b.set(self.output_folder.get())
         self.notebook.set("02   查找重复文件")
-        self._save_settings()
+        self._add_scan_folders([self.output_folder.get()])
 
     # ------------------------------------------------------------ 扫描流程
 
@@ -627,19 +746,18 @@ class EmojiApp(ctk.CTk):
         if self.busy:
             return
         try:
-            first = readable_directory(self.folder_a.get())
-            second = readable_directory(self.folder_b.get())
-            if overlaps(first, second):
-                raise ValueError("文件夹 A 和 B 不能是同一个目录，也不能互相包含。")
+            roots = prepare_folders(self.scan_folders)
         except (OSError, ValueError) as exc:
             messagebox.showerror("无法扫描", str(exc), parent=self)
             return
         self._invalidate_results()
         self._save_settings()
         recursive = self.recursive.get()
-        self._log(f"开始比较：A = {first}；B = {second}；包含子文件夹 = {recursive}")
+        self._log(f"开始扫描 {len(roots)} 个文件夹；包含子文件夹 = {recursive}")
+        for index, root in enumerate(roots, 1):
+            self._log(f"文件夹 {index}（保留优先级 {index}）：{root}")
         self._start_job("扫描重复文件",
-                        lambda cancel, report: find_duplicates(first, second, recursive, cancel, report),
+                        lambda cancel, report: find_duplicates(roots, recursive, cancel, report),
                         self._scanned)
 
     def _scanned(self, result: ScanResult) -> None:
@@ -651,11 +769,12 @@ class EmojiApp(ctk.CTk):
             self._log("重复文件扫描已取消，没有展示部分结果。")
             return
         self.scan_result = result
-        self.checked.clear()
+        self.keepers = default_keepers(result)
+        self.checked = {record.path for record in dedup_candidates(result, self.keepers)}
         self.page = 0
         self._update_summary()
         self._render_results()
-        count = sum(len(records) for records in result.files.values())
+        count = len(result.files)
         text = f"扫描完成：已计算 {count} 个文件，找到 {len(result.groups)} 组重复内容"
         if result.errors:
             text += f"；{len(result.errors)} 条异常详见操作记录"
@@ -667,34 +786,42 @@ class EmojiApp(ctk.CTk):
             return
         self.scan_result = None
         self.checked.clear()
+        self.keepers.clear()
         self.page = 0
-        self.summary_text.set("选择两个文件夹后开始扫描")
+        self.summary_text.set("添加一个或多个文件夹后开始扫描")
         self._render_results()
 
     def _update_summary(self) -> None:
         if self.scan_result is None:
             return
         groups = self.scan_result.groups
-        a_count = sum(len(group["A"]) for group in groups.values())
-        b_count = sum(len(group["B"]) for group in groups.values())
-        self.summary_text.set(f"{len(groups)} 组相同内容   ·   A 中 {a_count} 个重复文件   ·   "
-                              f"B 中 {b_count} 个重复文件")
+        candidates = dedup_candidates(self.scan_result, self.keepers)
+        count = sum(len(records) for records in groups.values())
+        self.summary_text.set(f"{len(groups)} 组重复 · {count} 份文件 · "
+                              f"可去重 {len(candidates)} 份（{format_size(sum(r.size for r in candidates))}）")
 
-    def _target_records(self) -> list[FileRecord]:
+    def _duplicate_records(self) -> list[FileRecord]:
         if self.scan_result is None:
             return []
-        side = self.target_side.get()
-        return sorted(
-            (record for group in self.scan_result.groups.values() for record in group[side]),
-            key=lambda record: (record.digest, record.relative.casefold()),
-        )
+        return dedup_candidates(self.scan_result, self.keepers)
 
-    def _change_side(self) -> None:
+    def _choose_keeper(self, digest: str, path: Path) -> None:
         if self.busy:
             return
-        self.checked.clear()
-        self.page = 0
-        self._render_results()
+        if self.scan_result is None or not any(record.path == path for record in self.scan_result.groups[digest]):
+            return
+        previous = self.keepers[digest]
+        self.keepers[digest] = path
+        self.checked.discard(path)
+        if previous != path:
+            self.checked.add(previous)
+        if digest in self.keeper_variables:
+            self.keeper_variables[digest].set(str(path))
+        for record in self.scan_result.groups[digest]:
+            if record.path in self.visible_checks:
+                self.visible_checks[record.path].set(record.path in self.checked)
+                self._set_enabled(self.visible_check_widgets[record.path], record.path != path)
+        self._update_selection()
 
     # ------------------------------------------------------------ 结果画廊
 
@@ -706,32 +833,35 @@ class EmojiApp(ctk.CTk):
         for child in self.gallery.winfo_children():
             child.destroy()
         self.visible_checks.clear()
+        self.visible_check_widgets.clear()
+        self.keeper_variables.clear()
         self.thumbnail_labels.clear()
         self.thumbnail_photos.clear()
-        records = self._target_records()
-        page_count = math.ceil(len(records) / PAGE_SIZE)
+        groups = list(self.scan_result.groups.items()) if self.scan_result else []
+        page_count = math.ceil(len(groups) / PAGE_SIZE)
         self.page = min(self.page, max(0, page_count - 1))
-        self.page_text.set(f"第 {self.page + 1 if records else 0} / {page_count} 页")
+        self.page_text.set(f"第 {self.page + 1 if groups else 0} / {page_count} 页")
         self._set_enabled(self.previous_button, self.page > 0 and not self.busy)
         self._set_enabled(self.next_button, self.page + 1 < page_count and not self.busy)
-        side = self.target_side.get()
-        other = "B" if side == "A" else "A"
         if self.scan_result:
-            self.target_hint.set(f"当前展示并清理 {side}：{self.scan_result.roots[side]}")
+            self.target_hint.set(f"已扫描 {len(self.scan_result.roots)} 个文件夹、{len(self.scan_result.files)} 个文件；"
+                                 "每组可改选保留副本。一键去重覆盖所有页。")
         else:
-            self.target_hint.set("扫描后选择要清理的一侧；另一侧保留。")
+            self.target_hint.set("每组可指定保留哪一份；清理时将其余副本移入回收站。")
         self._update_selection()
-        for column in range(4):
-            self.gallery.grid_columnconfigure(column, weight=1, uniform="cards")
-        if not records:
-            message = ("两个文件夹之间没有发现内容相同的文件。" if self.scan_result
-                       else "扫描完成后，重复文件的缩略图会显示在这里。")
+        self.gallery.grid_columnconfigure(0, weight=1)
+        if not groups:
+            message = ("所选文件夹中没有发现重复内容。" if self.scan_result
+                       else "扫描完成后，会按组展示所有重复文件及它们的位置。")
             ctk.CTkLabel(self.gallery, text=message, font=self.fonts["body"], text_color=PALETTE["muted"],
-                         justify="center", wraplength=620).grid(row=0, column=0, columnspan=4, pady=70)
+                          justify="center", wraplength=620).grid(row=0, column=0, pady=60)
             return
-        page_records = records[self.page * PAGE_SIZE:(self.page + 1) * PAGE_SIZE]
-        for index, record in enumerate(page_records):
-            self._build_card(index, record, side, other)
+        page_groups = groups[self.page * PAGE_SIZE:(self.page + 1) * PAGE_SIZE]
+        page_records = []
+        for index, (digest, records) in enumerate(page_groups):
+            keeper = next(record for record in records if record.path == self.keepers[digest])
+            page_records.append(keeper)
+            self._build_group(index, digest, records, keeper)
         cancel = self.thumbnail_cancel
 
         def load_thumbnails() -> None:
@@ -752,48 +882,86 @@ class EmojiApp(ctk.CTk):
         if page_records:
             threading.Thread(target=load_thumbnails, daemon=True, name="emoji-thumbnails").start()
 
-    def _build_card(self, index: int, record: FileRecord, side: str, other: str) -> None:
+    def _group_locations(self, records: list[FileRecord]) -> str:
+        counts: dict[Path, int] = {}
+        for record in records:
+            counts[record.root] = counts.get(record.root, 0) + 1
+        if len(counts) == 1:
+            kind = "文件夹内重复"
+        elif any(count > 1 for count in counts.values()):
+            kind = "跨文件夹及文件夹内重复"
+        else:
+            kind = "跨文件夹重复"
+        locations = "，".join(f"文件夹 {self.scan_result.roots.index(root) + 1} × {count}"
+                              for root, count in counts.items())
+        return f"{kind} · {locations}"
+
+    def _build_group(self, index: int, digest: str, records: list[FileRecord], keeper: FileRecord) -> None:
         card = ctk.CTkFrame(self.gallery, fg_color=PALETTE["raised"], corner_radius=12, border_width=1,
-                            border_color=PALETTE["border"])
-        card.grid(row=index // 4, column=index % 4, sticky="nsew", padx=6, pady=6)
+                             border_color=PALETTE["border"])
+        card.grid(row=index, column=0, sticky="ew", padx=6, pady=6)
         card.grid_columnconfigure(0, weight=1)
-        variable = tk.BooleanVar(value=record.path in self.checked)
-        self.visible_checks[record.path] = variable
-        ctk.CTkCheckBox(
-            card, text=f"{side} · 勾选此文件", variable=variable,
-            command=lambda r=record, v=variable: self._toggle_record(r, v.get()),
-            font=self.fonts["small"], text_color=PALETTE["ink"], fg_color=PALETTE["accent"],
-            hover_color=PALETTE["accent_hover"], border_color=PALETTE["muted"],
-            checkbox_width=20, checkbox_height=20, corner_radius=6,
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+        heading = ctk.CTkFrame(card, fg_color="transparent")
+        heading.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 5))
+        heading.grid_columnconfigure(0, weight=1)
+        number = self.page * PAGE_SIZE + index + 1
+        ctk.CTkLabel(heading, text=f"第 {number} 组 · {len(records)} 份相同内容 · 留 1 份，去重 {len(records) - 1} 份",
+                     font=self.fonts["body_bold"], text_color=PALETTE["ink"], anchor="w",
+                     justify="left", wraplength=700).grid(row=0, column=0, sticky="ew")
+        self._make_button(heading, "预览及完整路径", lambda r=keeper: self._preview(r), width=134).grid(
+            row=0, column=1, padx=(8, 0))
+        ctk.CTkLabel(card, text=self._group_locations(records), font=self.fonts["small"],
+                     text_color=PALETTE["accent"], anchor="w", justify="left", wraplength=870).grid(
+                         row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+        body.grid_columnconfigure(1, weight=1)
         label = ctk.CTkLabel(
-            card, text="正在加载缩略图…", font=self.fonts["small"], width=THUMB_SIZE[0], height=THUMB_SIZE[1],
+            body, text="正在加载缩略图…", font=self.fonts["small"], width=THUMB_SIZE[0], height=THUMB_SIZE[1],
             corner_radius=8, fg_color=PALETTE["placeholder"], text_color=PALETTE["muted"],
         )
-        label.grid(row=1, column=0, padx=12, pady=4)
-        label.bind("<Button-1>", lambda _event, r=record: self._preview(r))
+        label.grid(row=0, column=0, sticky="n", padx=(0, 14), pady=5)
+        label.bind("<Button-1>", lambda _event, r=keeper: self._preview(r))
         label.configure(cursor="hand2")
-        self.thumbnail_labels[record.path] = label
-        ctk.CTkLabel(card, text=record.path.name, font=self.fonts["small"], text_color=PALETTE["ink"],
-                     anchor="w", justify="left", wraplength=186).grid(row=2, column=0, sticky="ew", padx=12)
-        ctk.CTkLabel(card, text=f"{format_size(record.size)}   ·   {other} 中有 "
-                                f"{len(self.scan_result.groups[record.digest][other])} 份相同内容",
-                     font=self.fonts["tiny"], text_color=PALETTE["muted"], anchor="w", justify="left",
-                     wraplength=186).grid(row=3, column=0, sticky="ew", padx=12, pady=(5, 0))
-        parent_text = str(Path(record.relative).parent)
-        if parent_text != ".":
-            if len(parent_text) > 42:
-                parent_text = "…" + parent_text[-41:]
-            ctk.CTkLabel(card, text=parent_text, font=self.fonts["tiny"], text_color=PALETTE["muted"],
-                         anchor="w", justify="left", wraplength=186).grid(row=4, column=0, sticky="ew",
-                                                                          padx=12, pady=(2, 11))
-        else:
-            card.grid_rowconfigure(4, minsize=11)
+        self.thumbnail_labels[keeper.path] = label
+        copies = ctk.CTkFrame(body, fg_color="transparent")
+        copies.grid(row=0, column=1, sticky="ew")
+        copies.grid_columnconfigure(0, weight=1)
+        keep_variable = tk.StringVar(value=str(keeper.path))
+        self.keeper_variables[digest] = keep_variable
+        for offset, record in enumerate(records):
+            row = ctk.CTkFrame(copies, fg_color=PALETTE["surface"], corner_radius=8)
+            row.grid(row=offset, column=0, sticky="ew", pady=3)
+            row.grid_columnconfigure(2, weight=1)
+            ctk.CTkRadioButton(
+                row, text="保留此份", variable=keep_variable, value=str(record.path), width=100,
+                command=lambda d=digest, p=record.path: self._choose_keeper(d, p),
+                font=self.fonts["small"], text_color=PALETTE["ink"], fg_color=PALETTE["accent"],
+                border_color=PALETTE["muted"], radiobutton_width=18, radiobutton_height=18,
+            ).grid(row=0, column=0, sticky="w", padx=(10, 6), pady=(7, 2))
+            variable = tk.BooleanVar(value=record.path in self.checked)
+            self.visible_checks[record.path] = variable
+            check = ctk.CTkCheckBox(
+                row, text="删除", variable=variable, width=78,
+                command=lambda r=record, v=variable: self._toggle_record(r, v.get()),
+                font=self.fonts["small"], text_color=PALETTE["ink"], fg_color=PALETTE["danger"],
+                hover_color=PALETTE["danger_hover"], border_color=PALETTE["muted"],
+                checkbox_width=18, checkbox_height=18, corner_radius=5,
+            )
+            check.grid(row=0, column=1, sticky="w", pady=(7, 2))
+            self.visible_check_widgets[record.path] = check
+            self._set_enabled(check, record.path != keeper.path)
+            root_number = self.scan_result.roots.index(record.root) + 1
+            ctk.CTkLabel(row, text=f"文件夹 {root_number} · {format_size(record.size)}", font=self.fonts["tiny"],
+                         text_color=PALETTE["muted"], anchor="w").grid(row=0, column=2, sticky="w", pady=(7, 2))
+            ctk.CTkLabel(row, text=str(record.path), font=self.fonts["small"], text_color=PALETTE["ink_soft"],
+                         anchor="w", justify="left", wraplength=620).grid(
+                             row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 7))
 
     def _toggle_record(self, record: FileRecord, checked: bool) -> None:
         if self.busy:
             return
-        if checked:
+        if checked and record.path != self.keepers.get(record.digest):
             self.checked.add(record.path)
         else:
             self.checked.discard(record.path)
@@ -802,9 +970,9 @@ class EmojiApp(ctk.CTk):
     def _select_all(self) -> None:
         if self.busy:
             return
-        self.checked = {record.path for record in self._target_records()}
-        for variable in self.visible_checks.values():
-            variable.set(True)
+        self.checked = {record.path for record in self._duplicate_records()}
+        for path, variable in self.visible_checks.items():
+            variable.set(path in self.checked)
         self._update_selection()
 
     def _select_none(self) -> None:
@@ -816,10 +984,11 @@ class EmojiApp(ctk.CTk):
         self._update_selection()
 
     def _update_selection(self) -> None:
-        records = [record for record in self._target_records() if record.path in self.checked]
+        records = [record for record in self._duplicate_records() if record.path in self.checked]
         total = sum(record.size for record in records)
         self.selection_text.set(f"已勾选 {len(records)} 个 · {format_size(total)}")
         self._set_enabled(self.delete_button, bool(records) and not self.busy)
+        self._set_enabled(self.dedup_button, bool(self.scan_result and self.scan_result.groups) and not self.busy)
 
     def _turn_page(self, delta: int) -> None:
         if self.busy:
@@ -862,15 +1031,17 @@ class EmojiApp(ctk.CTk):
         digest.insert(0, record.digest)
         digest.configure(state="readonly")
         digest.pack(fill="x")
-        other = "B" if self.target_side.get() == "A" else "A"
-        ctk.CTkLabel(body, text=f"文件夹 {other} 中内容相同的文件", font=self.fonts["body_bold"],
+        ctk.CTkLabel(body, text="本组所有副本及保留位置", font=self.fonts["body_bold"],
                      text_color=PALETTE["ink"], anchor="w").pack(anchor="w", pady=(16, 6))
         matches = ctk.CTkTextbox(body, height=110, corner_radius=10, fg_color=PALETTE["surface"],
                                  border_width=1, border_color=PALETTE["border"], text_color=PALETTE["ink_soft"],
                                  font=self.fonts["small"])
         matches.pack(fill="both", expand=True)
-        for candidate in self.scan_result.groups[record.digest][other]:
-            matches.insert("end", str(candidate.path) + "\n")
+        group = self.scan_result.groups[record.digest]
+        matches.insert("end", self._group_locations(group) + "\n\n")
+        for candidate in group:
+            kind = "保留副本" if candidate.path == self.keepers[record.digest] else "多余副本"
+            matches.insert("end", f"【{kind}】{candidate.path}\n")
         matches.configure(state="disabled")
         buttons = ctk.CTkFrame(body, fg_color="transparent")
         buttons.pack(fill="x", pady=(14, 0))
@@ -890,42 +1061,53 @@ class EmojiApp(ctk.CTk):
     def _delete(self) -> None:
         if self.busy or self.scan_result is None:
             return
-        selected = [record for record in self._target_records() if record.path in self.checked]
+        selected = [record for record in self._duplicate_records() if record.path in self.checked]
+        self._confirm_cleanup(selected, all_duplicates=False)
+
+    def _deduplicate(self) -> None:
+        if self.busy or self.scan_result is None:
+            return
+        self._confirm_cleanup(self._duplicate_records(), all_duplicates=True)
+
+    def _confirm_cleanup(self, selected: list[FileRecord], all_duplicates: bool) -> None:
         if not selected:
             return
-        side = self.target_side.get()
-        other = "B" if side == "A" else "A"
         scan = self.scan_result
+        keepers = dict(self.keepers)
         size = format_size(sum(record.size for record in selected))
+        digests = list(dict.fromkeys(record.digest for record in selected))
+        locations = "\n".join(str(keepers[digest]) for digest in digests[:6])
+        if len(digests) > 6:
+            locations += f"\n……另 {len(digests) - 6} 组的保留位置见结果列表。"
+        action = "一键去重（覆盖所有页）" if all_duplicates else "清理勾选项"
         confirmed = messagebox.askyesno(
             "确认移入回收站",
-            f"将文件夹 {side} 中勾选的 {len(selected)} 个文件（{size}）移入回收站：\n"
-            f"{scan.roots[side]}\n\n"
-            f"保留文件夹 {other}：\n{scan.roots[other]}\n\n"
-            "删除前会重新检查文件内容及另一侧副本。是否继续？",
+            f"{action}：将 {len(digests)} 组中的 {len(selected)} 份多余副本（{size}）移入回收站。\n\n"
+            f"每组指定的以下副本保留：\n{locations}\n\n"
+            "删除前会重新校验待删文件和保留副本。保留副本丢失或发生变化时跳过删除。是否继续？",
             parent=self, icon="warning", default="no",
         )
         if not confirmed:
             return
         self.thumbnail_cancel.set()
-        self._log(f"清理文件夹 {side}：用户确认将 {len(selected)} 个勾选文件移入回收站。")
+        self._log(f"{action}：用户确认将 {len(selected)} 份多余副本移入回收站。")
+        for digest in digests:
+            self._log(f"指定保留：{keepers[digest]}")
         self._start_job("清理重复文件",
-                        lambda cancel, report: delete_duplicates(scan, side, selected, cancel, report),
+                        lambda cancel, report: delete_duplicates(scan, selected, keepers, cancel, report),
                         self._deleted)
 
     def _deleted(self, result: OperationResult) -> None:
         removed = set(result.completed)
         if self.scan_result:
-            for side in ("A", "B"):
-                self.scan_result.files[side] = [record for record in self.scan_result.files[side]
-                                                if record.path not in removed]
+            self.scan_result.files = [record for record in self.scan_result.files if record.path not in removed]
             groups = {}
-            for digest, group in self.scan_result.groups.items():
-                updated = {side: [record for record in group[side] if record.path not in removed]
-                           for side in ("A", "B")}
-                if updated["A"] and updated["B"]:
+            for digest, records in self.scan_result.groups.items():
+                updated = [record for record in records if record.path not in removed]
+                if len(updated) > 1:
                     groups[digest] = updated
             self.scan_result.groups = groups
+            self.keepers = {digest: self.keepers[digest] for digest in groups}
         self.checked.clear()
         self._update_summary()
         self._render_results()
@@ -938,7 +1120,7 @@ class EmojiApp(ctk.CTk):
             text += "尚未处理的文件保留。"
         self.status.set(text)
         if not self.close_pending:
-            messagebox.showinfo(title, text + "\n\n另一侧文件保持不变。详细结果见“操作记录”。", parent=self)
+            messagebox.showinfo(title, text + "\n\n各组指定的保留副本已保留。详细结果见“操作记录”。", parent=self)
 
     # ------------------------------------------------------------ 任务与状态
 
@@ -964,6 +1146,8 @@ class EmojiApp(ctk.CTk):
             self._set_enabled(widget, True)
             if previous.get("state") == "disabled":
                 self._set_enabled(widget, False)
+            elif previous.get("state") == "readonly":
+                widget.configure(state="readonly")
         self.disabled_widgets = []
         self._set_enabled(self.cancel_button, False)
 
@@ -1115,9 +1299,10 @@ class EmojiApp(ctk.CTk):
         self.closed = True
         self.thumbnail_cancel.set()
         self.progress.stop()
-        # 关闭时同时撤销启动检测及轮询，避免 Tk 销毁后仍执行定时回调。
+        # 取消本解释器的定时执行，但由各控件销毁自己的已注册命令。
+        # 根窗口的 after_cancel 会提前删除子控件命令，导致销毁时重复删除。
         for after_id in self.tk.splitlist(self.tk.call("after", "info")):
-            self.after_cancel(after_id)
+            self.tk.call("after", "cancel", after_id)
         self._save_settings()
         self.destroy()
 

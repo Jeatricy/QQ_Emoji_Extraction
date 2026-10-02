@@ -109,13 +109,14 @@ class FileRecord:
     size: int
     digest: str
     stamp: tuple[int, int, int, int, int]
+    root: Path
 
 
 @dataclass
 class ScanResult:
-    roots: dict[str, Path]
-    files: dict[str, list[FileRecord]]
-    groups: dict[str, dict[str, list[FileRecord]]]
+    roots: list[Path]
+    files: list[FileRecord]
+    groups: dict[str, list[FileRecord]]
     errors: list[str] = field(default_factory=list)
     cancelled: bool = False
 
@@ -239,7 +240,7 @@ def hash_file(path: Path, root: Path, cancel: threading.Event) -> FileRecord:
         after = os.fstat(stream.fileno())
     if signature(before) != signature(after) or signature(path.stat()) != signature(after):
         raise ValueError("读取期间文件发生变化，请重新扫描。")
-    return FileRecord(path, str(path.relative_to(root)), before.st_size, digest.hexdigest(), signature(after))
+    return FileRecord(path, str(path.relative_to(root)), before.st_size, digest.hexdigest(), signature(after), root)
 
 
 def export_emojis(
@@ -308,34 +309,56 @@ def export_emojis(
     return result
 
 
+def prepare_folders(folders: list[Path]) -> list[Path]:
+    """规范化目录并保持保留优先级；相同目录只加入一次。"""
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for folder in folders:
+        root = readable_directory(str(folder))
+        key = normalized(root)
+        if key not in seen:
+            roots.append(root)
+            seen.add(key)
+    if not roots:
+        raise ValueError("请至少添加一个要扫描的文件夹。")
+    return roots
+
+
 def find_duplicates(
-    first: Path, second: Path, recursive: bool, cancel: threading.Event, report: Reporter
+    folders: list[Path], recursive: bool, cancel: threading.Event, report: Reporter
 ) -> ScanResult:
-    if overlaps(first, second):
-        raise ValueError("两个文件夹不能相同，也不能互相包含。")
-    roots = {"A": first, "B": second}
-    result = ScanResult(roots=roots, files={"A": [], "B": []}, groups={})
+    roots = prepare_folders(folders)
+    result = ScanResult(roots=roots, files=[], groups={})
     try:
-        pending: list[tuple[str, Path]] = []
-        for side, root in roots.items():
-            report("progress", (0, 0, f"正在列出文件夹 {side} 的文件…"))
+        pending: list[tuple[Path, Path]] = []
+        seen_files: set[str] = set()
+        for number, root in enumerate(roots, 1):
+            report("progress", (0, 0, f"正在列出文件夹 {number} 的文件…"))
             for path in walk_files(root, recursive, cancel, result.errors):
-                pending.append((side, path))
-        by_hash: dict[str, dict[str, list[FileRecord]]] = {
-            "A": defaultdict(list), "B": defaultdict(list)
-        }
-        for index, (side, path) in enumerate(pending, 1):
+                # 同时选择父目录和子目录时，同一路径只算一份。
+                key = normalized(path)
+                if key not in seen_files:
+                    pending.append((root, path))
+                    seen_files.add(key)
+        by_hash: dict[str, list[FileRecord]] = defaultdict(list)
+        priorities = {root: number for number, root in enumerate(roots)}
+        for index, (root, path) in enumerate(pending, 1):
             check_cancel(cancel)
-            report("progress", (index - 1, len(pending), f"计算 SHA-256 · {side} · {path.name}"))
+            report("progress", (index - 1, len(pending), f"计算 SHA-256 · 文件夹 {priorities[root] + 1} · {path.name}"))
             try:
-                record = hash_file(path, roots[side], cancel)
-                result.files[side].append(record)
-                by_hash[side][record.digest].append(record)
+                record = hash_file(path, root, cancel)
+                result.files.append(record)
+                by_hash[record.digest].append(record)
             except (OSError, ValueError) as exc:
                 result.errors.append(f"读取失败 {path}：{exc}")
             report("progress", (index, len(pending), f"已计算 {index}/{len(pending)} 个文件"))
-        for digest in sorted(by_hash["A"].keys() & by_hash["B"].keys()):
-            result.groups[digest] = {side: by_hash[side][digest] for side in ("A", "B")}
+        for digest, records in sorted(by_hash.items()):
+            check_cancel(cancel)
+            if len(records) > 1:
+                result.groups[digest] = sorted(
+                    records,
+                    key=lambda record: (priorities[record.root], record.relative.casefold(), record.relative),
+                )
     except Cancelled:
         result.cancelled = True
         # 取消时不展示尚未完整扫描的结果，避免把部分结果当成全量。
@@ -343,45 +366,64 @@ def find_duplicates(
     return result
 
 
+def default_keepers(scan: ScanResult) -> dict[str, Path]:
+    """每组默认保留目录优先级最高、相对路径排序最靠前的一份。"""
+    return {digest: records[0].path for digest, records in scan.groups.items()}
+
+
+def dedup_candidates(scan: ScanResult, keepers: dict[str, Path]) -> list[FileRecord]:
+    """生成覆盖所有重复组的清理计划，明确排除每组保留副本。"""
+    if scan.cancelled:
+        raise ValueError("扫描结果已取消，请重新扫描。")
+    candidates: list[FileRecord] = []
+    for digest, records in scan.groups.items():
+        keeper = keepers.get(digest)
+        if keeper is None or not any(record.path == keeper for record in records):
+            raise ValueError("某组没有有效的保留副本，请重新扫描或指定保留文件。")
+        candidates.extend(record for record in records if record.path != keeper)
+    return candidates
+
+
 def delete_duplicates(
     scan: ScanResult,
-    side: str,
     selected: list[FileRecord],
+    keepers: dict[str, Path],
     cancel: threading.Event,
     report: Reporter,
 ) -> OperationResult:
     from send2trash import send2trash
 
     result = OperationResult()
-    other = "B" if side == "A" else "A"
-    if scan.cancelled or overlaps(scan.roots["A"], scan.roots["B"]):
+    if scan.cancelled or not scan.roots:
         raise ValueError("扫描结果无效，请重新扫描。")
+    dedup_candidates(scan, keepers)
+    selected = list({record.path: record for record in selected}.values())
     try:
         for index, record in enumerate(selected, 1):
             check_cancel(cancel)
             report("progress", (index - 1, len(selected), f"校验并移入回收站 · {record.path.name}"))
             try:
                 group = scan.groups.get(record.digest)
-                if not group or record not in group[side]:
+                if not group or record not in group or record.root not in scan.roots:
                     raise ValueError("该文件不在本次重复文件结果中。")
-                current = hash_file(record.path, scan.roots[side], cancel)
+                keeper_record = next(candidate for candidate in group if candidate.path == keepers[record.digest])
+                if record.path == keeper_record.path:
+                    raise ValueError("这是本组指定保留的副本，不能删除。")
+                current = hash_file(record.path, record.root, cancel)
                 if current.stamp != record.stamp or current.digest != record.digest:
                     raise ValueError("文件自扫描后已变化，请重新扫描。")
-                # 每次删除前重新检查另一侧至少有一份内容相同的文件。
-                keeper = None
-                for candidate in group[other]:
-                    try:
-                        copy = hash_file(candidate.path, scan.roots[other], cancel)
-                        if copy.digest == record.digest and copy.size == record.size:
-                            keeper = copy
-                            break
-                    except (OSError, ValueError):
-                        continue
-                if keeper is None:
-                    raise ValueError("另一侧已没有可读取的相同文件，已跳过。")
+                # 保留副本始终排除在清理计划外，每次删除都重新验证。
+                # 保留副本消失或变化时跳过整组剩余副本，避免删掉最后一份。
+                try:
+                    keeper = hash_file(keeper_record.path, keeper_record.root, cancel)
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f"指定保留副本无法读取，已跳过：{exc}") from exc
+                if (keeper.stamp != keeper_record.stamp or keeper.digest != record.digest
+                        or keeper.size != record.size):
+                    raise ValueError("指定保留副本自扫描后已变化，请重新扫描。")
                 check_cancel(cancel)
-                ensure_regular_under(record.path, scan.roots[side])
-                ensure_regular_under(keeper.path, scan.roots[other])
+                ensure_regular_under(record.path, record.root)
+                ensure_regular_under(keeper.path, keeper.root)
                 if signature(record.path.stat()) != current.stamp or signature(keeper.path.stat()) != keeper.stamp:
                     raise ValueError("校验后文件发生变化，已跳过。")
                 # 回收失败时报告错误，不回退到永久删除。
