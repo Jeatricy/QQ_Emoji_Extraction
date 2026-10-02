@@ -1,0 +1,21 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 产物：打包好的 exe 只作为 Releases 附件，不进源码仓库
+build/
+dist/
+*.spec.bak
+QQ表情包提取.exe
+QQEmojiExtraction.exe
+
+# 运行期生成
+qq_emoji_settings.json
+qq_emoji_settings.json.tmp
+qq_emoji_tool.log*
+导出的表情包/
