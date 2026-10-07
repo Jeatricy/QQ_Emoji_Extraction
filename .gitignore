@@ -17,7 +17,6 @@ QQ表情包提取.exe
 QQEmojiExtraction.exe
 
 # 本地发布暂存、测试与预览
-.release-src/
 tests/
 界面预览/
 .dedup-test-*/
